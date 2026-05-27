@@ -156,14 +156,34 @@ async function executeWaterfall(id, channelFallbackName) {
     // Start fetching latest video title in background immediately
     const lastVideoPromise = fetchLatestVideoTitle(window.location.href);
 
-    // Helper to find emails
+    // Helper to find emails with robust filtering
     const extractEmails = (text) => {
         if (!text) return [];
-        // Safer regex using matchAll to extract group 1. Ensures it doesn't match filenames like image@2x.png
-        const regex = /(?:^|[^a-zA-Z0-9._-])([a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
+        // Extract emails ensuring no trailing non-word characters are captured as TLDs.
+        const regex = /(?:^|[^a-zA-Z0-9.+_-])([a-zA-Z0-9.+_-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,10})/gi;
         const matches = [...text.matchAll(regex)]
-            .map(m => m[1].toLowerCase())
-            .filter(e => !e.endsWith('.png') && !e.endsWith('.jpg') && !e.endsWith('.jpeg') && !e.endsWith('.gif') && !e.endsWith('.svg'));
+            .map(m => m[1]) // keep original case to detect run-on sentences
+            .filter(e => {
+                const lower = e.toLowerCase();
+                if (lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.gif') || lower.endsWith('.svg') || lower.endsWith('.webp')) return false;
+                if (lower.includes('@example.com') || lower.includes('@domain.com') || lower.includes('@email.com') || lower.includes('@yourdomain.com') || lower.includes('sentry.io')) return false;
+                if (/^[\._-]/.test(lower)) return false; // Block if starts with punctuation
+                return true;
+            })
+            .map(e => {
+                // Fix concatenated sentences like email@gmail.comPlease
+                const runOnMatch = e.match(/(.*?(\.com|\.net|\.org|\.co\.uk|\.io|\.co|\.us|\.ca|\.au))([A-Z].*)/);
+                if (runOnMatch) {
+                    return runOnMatch[1].toLowerCase();
+                }
+                // Fix lowercase concatenations with common invalid TLD-like suffixes (e.g. .comthanks)
+                const lower = e.toLowerCase();
+                const invalidSuffixMatch = lower.match(/(.*?(\.com|\.net|\.org))(please|thanks|thankyou|and|for|here)$/);
+                if (invalidSuffixMatch) {
+                    return invalidSuffixMatch[1];
+                }
+                return lower;
+            });
         return [...new Set(matches)];
     };
 
