@@ -1,5 +1,56 @@
 // Content script injected into YouTube
 
+// Inject a network interceptor to catch emails fetched by other extensions in the background
+const interceptScript = document.createElement('script');
+interceptScript.textContent = `
+    (function() {
+        const emailRegex = /([a-zA-Z0-9.+_-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,10})/gi;
+        
+        function scanAndReport(text) {
+            if (typeof text !== 'string') return;
+            const matches = text.match(emailRegex);
+            if (matches) {
+                window.postMessage({ type: 'INTERCEPTED_EMAIL', emails: matches }, '*');
+            }
+        }
+
+        // Intercept Fetch
+        const originalFetch = window.fetch;
+        window.fetch = async function(...args) {
+            const response = await originalFetch.apply(this, args);
+            try {
+                const clone = response.clone();
+                clone.text().then(scanAndReport).catch(()=>{});
+            } catch(e) {}
+            return response;
+        };
+
+        // Intercept XHR
+        const originalOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function() {
+            this.addEventListener('load', function() {
+                try {
+                    if (this.responseText) scanAndReport(this.responseText);
+                } catch(e) {}
+            });
+            originalOpen.apply(this, arguments);
+        };
+    })();
+`;
+(document.head || document.documentElement).appendChild(interceptScript);
+
+let interceptedEmails = new Set();
+window.addEventListener('message', (e) => {
+    if (e.data && e.data.type === 'INTERCEPTED_EMAIL' && e.data.emails) {
+        e.data.emails.forEach(email => {
+            const lower = email.toLowerCase();
+            if (!lower.includes('youtube.com') && !lower.includes('sentry.io')) {
+                interceptedEmails.add(lower);
+            }
+        });
+    }
+});
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'START_SCRAPE') {
         const { id, name } = message.payload;
@@ -220,7 +271,7 @@ async function executeWaterfall(id, channelFallbackName) {
     const headerEls = document.querySelectorAll('button, yt-formatted-string, span, div');
     const moreBtn = Array.from(headerEls).find(el => {
         const text = el.textContent.trim().toLowerCase();
-        return text === '...more' || text === '... more' || text === 'about' || text === 'more about this channel';
+        return text === '...more' || text === '... more' || text === 'about' || text === 'more about this channel' || text === 'more';
     });
     
     if (moreBtn) {
@@ -270,22 +321,86 @@ async function executeWaterfall(id, channelFallbackName) {
     // --- STEP 1: The Easy Grab (Scrape Text and Links) ---
     console.log('[LeadTube Bot] Step 1: Scanning public text and links...');
     
-    // Scrape all text on page (including hidden modals!) but explicitly ignore <script> and <style> tags
-    // to prevent extracting literal '\n' prefixes or fake emails generated in minified JS bundles.
-    let cleanText = '';
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-    let node;
-    while (node = walker.nextNode()) {
-        const parentName = node.parentNode.nodeName;
-        if (parentName !== 'SCRIPT' && parentName !== 'STYLE' && parentName !== 'NOSCRIPT') {
-            cleanText += ' ' + node.nodeValue;
+    // Helper to get all text including shadow DOMs, input values, tooltips, and ALL attributes
+    const getAllTextAndAttributes = (root) => {
+        if (!root) return '';
+        let text = '';
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null, false);
+        let node;
+        while (node = walker.nextNode()) {
+            const parentName = node.parentNode ? node.parentNode.nodeName : '';
+            if (parentName !== 'SCRIPT' && parentName !== 'STYLE' && parentName !== 'NOSCRIPT') {
+                text += ' ' + node.nodeValue;
+            }
         }
-    }
-    const bodyText = cleanText;
-    emails = extractEmails(bodyText);
+        const elements = root.querySelectorAll ? root.querySelectorAll('*') : [];
+        for (let el of elements) {
+            // Check ALL attributes for anything that might contain an email
+            if (el.attributes) {
+                for (let i = 0; i < el.attributes.length; i++) {
+                    const attr = el.attributes[i];
+                    if (attr.value && attr.value.includes('@')) {
+                        text += ' ' + attr.value;
+                    }
+                }
+            }
+            // Check input fields where extensions might place the email
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                text += ' ' + (el.value || '') + ' ' + (el.placeholder || '');
+            }
+            // Traverse shadow DOMs
+            if (el.shadowRoot) {
+                text += ' ' + getAllTextAndAttributes(el.shadowRoot);
+            }
+            // Traverse same-origin iframes
+            if (el.tagName === 'IFRAME') {
+                try {
+                    if (el.contentDocument && el.contentDocument.documentElement) {
+                        text += ' ' + getAllTextAndAttributes(el.contentDocument.documentElement);
+                    }
+                } catch(e) {}
+            }
+        }
+        return text;
+    };
 
-    // Avoid false positives like generic youtube emails
-    emails = emails.filter(e => !e.includes('youtube.com') && !e.includes('sentry.io'));
+    // Poll for up to 12 seconds to give third-party extensions time to load and inject emails
+    let emailsFoundAt = -1;
+    let allFoundEmails = new Set();
+
+    for (let i = 0; i < 12; i++) {
+        let bodyText = getAllTextAndAttributes(document.documentElement);
+        // Fallback: Also regex the entire raw HTML string in case the DOM walker missed a hidden extension element
+        let rawHtml = document.documentElement.innerHTML || '';
+        
+        let currentEmails = extractEmails(bodyText + ' ' + rawHtml);
+
+        // Avoid false positives like generic youtube emails
+        currentEmails = currentEmails.filter(e => !e.includes('youtube.com') && !e.includes('sentry.io'));
+        
+        if (currentEmails.length > 0) {
+            currentEmails.forEach(e => allFoundEmails.add(e));
+            if (emailsFoundAt === -1) emailsFoundAt = i;
+        }
+
+        // Also check if our network interceptor caught anything from third-party APIs
+        if (interceptedEmails.size > 0) {
+            interceptedEmails.forEach(e => allFoundEmails.add(e));
+            if (emailsFoundAt === -1) emailsFoundAt = i;
+        }
+
+        // Break if we've found emails AND waited at least 3 extra seconds to let other extensions finish loading
+        if (emailsFoundAt !== -1 && (i - emailsFoundAt) >= 3) {
+            break;
+        }
+        
+        await sleep(1000); // Wait 1s before trying again
+    }
+    
+    // Final collection of intercepted network emails just in case
+    interceptedEmails.forEach(e => allFoundEmails.add(e));
+    
+    emails = Array.from(allFoundEmails);
 
     // Scrape social links aggressively by checking ALL links on the page
     const linkElements = document.querySelectorAll('a[href]');
@@ -358,10 +473,10 @@ async function executeWaterfall(id, channelFallbackName) {
             console.log('[LeadTube Bot] CAPTCHA detected! Pausing and alerting user...');
             chrome.runtime.sendMessage({ type: 'REQUIRE_MANUAL_CAPTCHA' });
 
-            // Poll every 1 second until the email appears (user solved captcha)
+            // Poll every 200ms until the email appears (user solved captcha)
             let waitAttempts = 0;
-            while (waitAttempts < 300) { // wait up to 5 minutes
-                await sleep(1000);
+            while (waitAttempts < 1500) { // wait up to 5 minutes
+                await sleep(200);
                 
                 // Check if email link appeared (usually a mailto: link)
                 const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));

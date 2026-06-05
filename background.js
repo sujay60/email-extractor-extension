@@ -6,10 +6,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'BG_COMMAND_SCRAPE') {
         const { id, name, url, delayMs } = message.payload;
         
-        // Ensure the URL ends with /about for the easiest scraping
-        let targetUrl = url;
-        if (!targetUrl.endsWith('/about')) {
-            targetUrl = targetUrl.replace(/\/$/, '') + '/about';
+        let targetUrl = url.trim();
+        if (!/^https?:\/\//i.test(targetUrl)) {
+            targetUrl = 'https://' + targetUrl;
         }
 
         // Create a tiny floating popup window for the scraping.
@@ -19,7 +18,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             type: 'popup',
             width: 800,
             height: 600,
-            focused: false 
+            focused: true 
         }, (window) => {
             const tabId = window.tabs[0].id;
             activeScrapes.set(tabId, { id, name, url: targetUrl, windowId: window.id });
@@ -29,27 +28,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // 2. YouTube scraper finished
     if (message.type === 'SCRAPE_DONE') {
         const tabId = sender.tab.id;
-        const scrapeInfo = activeScrapes.get(tabId);
         
-        if (scrapeInfo) {
-            // Forward result to dashboard
-            chrome.tabs.query({}, (tabs) => {
-                for (const t of tabs) {
-                    chrome.tabs.sendMessage(t.id, {
-                        type: 'BG_SCRAPE_RESULT',
-                        payload: message.payload
-                    }).catch(() => {}); // ignore errors for tabs without our listener
-                }
-            });
-
-            // Clean up: close the popup window
-            if (scrapeInfo.windowId) {
-                chrome.windows.remove(scrapeInfo.windowId).catch(()=>{});
-            } else {
-                chrome.tabs.remove(tabId).catch(()=>{});
+        // Forward result to dashboard unconditionally (Broadcast to all tabs, dashboard-bridge will pick it up)
+        chrome.tabs.query({}, (tabs) => {
+            for (const t of tabs) {
+                chrome.tabs.sendMessage(t.id, {
+                    type: 'BG_SCRAPE_RESULT',
+                    payload: message.payload
+                }).catch(() => {}); // ignore errors for tabs without our listener
             }
-            activeScrapes.delete(tabId);
+        });
+
+        // Clean up: close the popup window using the sender's windowId
+        if (sender.tab && sender.tab.windowId) {
+            chrome.windows.remove(sender.tab.windowId).catch(()=>{});
+        } else {
+            chrome.tabs.remove(tabId).catch(()=>{});
         }
+        
+        activeScrapes.delete(tabId);
     }
 
     // 3. YouTube scraper requires manual CAPTCHA solving
