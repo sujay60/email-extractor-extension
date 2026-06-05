@@ -364,19 +364,46 @@ async function executeWaterfall(id, channelFallbackName) {
         return text;
     };
 
+    // Helper to deeply scan React/Vue props for hidden emails
+    const scanFrameworkProps = () => {
+        let found = [];
+        try {
+            const allElements = document.documentElement.querySelectorAll('*');
+            for (let el of allElements) {
+                for (let key in el) {
+                    if (key.startsWith('__react') || key.startsWith('__vue') || key.startsWith('__jsaction')) {
+                        try {
+                            const str = JSON.stringify(el[key]);
+                            if (str && str.includes('@')) {
+                                const matches = extractEmails(str);
+                                matches.forEach(m => found.push(m));
+                            }
+                        } catch(e) {}
+                    }
+                }
+            }
+            // Scan storage
+            for (let i = 0; i < localStorage.length; i++) found.push(...extractEmails(localStorage.getItem(localStorage.key(i)) || ''));
+            for (let i = 0; i < sessionStorage.length; i++) found.push(...extractEmails(sessionStorage.getItem(sessionStorage.key(i)) || ''));
+        } catch(e) {}
+        return found;
+    };
+
     // Poll for up to 12 seconds to give third-party extensions time to load and inject emails
     let emailsFoundAt = -1;
     let allFoundEmails = new Set();
 
     for (let i = 0; i < 12; i++) {
         let bodyText = getAllTextAndAttributes(document.documentElement);
-        // Fallback: Also regex the entire raw HTML string in case the DOM walker missed a hidden extension element
         let rawHtml = document.documentElement.innerHTML || '';
         
         let currentEmails = extractEmails(bodyText + ' ' + rawHtml);
+        
+        // Add framework prop scanning
+        currentEmails = currentEmails.concat(scanFrameworkProps());
 
         // Avoid false positives like generic youtube emails
-        currentEmails = currentEmails.filter(e => !e.includes('youtube.com') && !e.includes('sentry.io'));
+        currentEmails = currentEmails.filter(e => !e.includes('youtube.com') && !e.includes('sentry.io') && !e.includes('w3.org') && !e.includes('schema.org'));
         
         if (currentEmails.length > 0) {
             currentEmails.forEach(e => allFoundEmails.add(e));
@@ -472,17 +499,40 @@ async function executeWaterfall(id, channelFallbackName) {
         if (captchaIframe) {
             console.log('[LeadTube Bot] CAPTCHA detected! Pausing and alerting user...');
             chrome.runtime.sendMessage({ type: 'REQUIRE_MANUAL_CAPTCHA' });
+            
+            // Inject a floating fallback UI so user can paste the email directly from EasyKOL
+            const fallbackDiv = document.createElement('div');
+            fallbackDiv.innerHTML = \`
+                <div style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #1e1e2e; color: white; padding: 15px 25px; border-radius: 8px; z-index: 999999; box-shadow: 0 10px 25px rgba(0,0,0,0.5); border: 2px solid #8b5cf6; display: flex; align-items: center; gap: 15px; font-family: sans-serif;">
+                    <div>
+                        <strong style="color: #10b981;">LeadTube Paused on CAPTCHA</strong><br/>
+                        <span style="font-size: 12px; color: #a1a1aa;">If EasyKOL found the email, paste it here to skip CAPTCHA!</span>
+                    </div>
+                    <input type="text" id="leadtube-quick-email" placeholder="Paste email here..." style="padding: 8px 12px; border-radius: 4px; border: 1px solid #4b5563; background: #374151; color: white; outline: none; min-width: 200px;" />
+                    <button id="leadtube-quick-submit" style="background: #8b5cf6; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">Skip CAPTCHA</button>
+                </div>
+            \`;
+            document.body.appendChild(fallbackDiv);
+            
+            document.getElementById('leadtube-quick-submit').addEventListener('click', () => {
+                const val = document.getElementById('leadtube-quick-email').value.trim();
+                if (val && val.includes('@')) {
+                    emails = [val];
+                    fallbackDiv.remove();
+                }
+            });
 
-            // Poll every 200ms until the email appears (user solved captcha)
+            // Poll every 200ms until the email appears (user solved captcha OR pasted into fallback)
             let waitAttempts = 0;
-            while (waitAttempts < 1500) { // wait up to 5 minutes
+            while (waitAttempts < 1500 && emails.length === 0) { // wait up to 5 minutes
                 await sleep(200);
                 
-                // Check if email link appeared (usually a mailto: link)
+                // Check if email link appeared (usually a mailto: link from CAPTCHA solve)
                 const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));
                 if (mailtoLinks.length > 0) {
                     emails = [mailtoLinks[0].href.replace('mailto:', '').trim()];
                     console.log('[LeadTube Bot] CAPTCHA Solved! Extracted email:', emails);
+                    if (fallbackDiv) fallbackDiv.remove();
                     break;
                 }
                 waitAttempts++;
