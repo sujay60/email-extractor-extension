@@ -271,7 +271,7 @@ async function executeWaterfall(id, channelFallbackName) {
     const headerEls = document.querySelectorAll('button, yt-formatted-string, span, div');
     const moreBtn = Array.from(headerEls).find(el => {
         const text = el.textContent.trim().toLowerCase();
-        return text === '...more' || text === '... more' || text === 'about' || text === 'more about this channel' || text === 'more';
+        return text === '...more' || text === '... more' || text === 'about' || text === 'more about this channel' || text === 'more' || text === '…more' || text === '… more';
     });
     
     if (moreBtn) {
@@ -479,9 +479,32 @@ async function executeWaterfall(id, channelFallbackName) {
     // --- STEP 2: The Last Resort (CAPTCHA Button) ---
     console.log('[LeadTube Bot] Step 2: Looking for "View email address" button...');
     
+    // Unconditionally inject the floating fallback UI right now, so the user can paste the email EVEN IF the button isn't found
+    const fallbackDiv = document.createElement('div');
+    fallbackDiv.innerHTML = \`
+        <div style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #1e1e2e; color: white; padding: 15px 25px; border-radius: 8px; z-index: 999999; box-shadow: 0 10px 25px rgba(0,0,0,0.5); border: 2px solid #8b5cf6; display: flex; align-items: center; gap: 15px; font-family: sans-serif;">
+            <div>
+                <strong style="color: #10b981;">LeadTube Manual Fallback</strong><br/>
+                <span style="font-size: 12px; color: #a1a1aa;">If EasyKOL found the email, paste it here to skip instantly!</span>
+            </div>
+            <input type="text" id="leadtube-quick-email" placeholder="Paste email here..." style="padding: 8px 12px; border-radius: 4px; border: 1px solid #4b5563; background: #374151; color: white; outline: none; min-width: 200px;" />
+            <button id="leadtube-quick-submit" style="background: #8b5cf6; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">Submit & Next</button>
+        </div>
+    \`;
+    document.body.appendChild(fallbackDiv);
+    
+    document.getElementById('leadtube-quick-submit').addEventListener('click', () => {
+        const val = document.getElementById('leadtube-quick-email').value.trim();
+        if (val && val.includes('@')) {
+            emails = [val];
+        }
+    });
+
+    // We will poll for up to 15 seconds. If the user pastes an email OR solves a captcha, we win.
+    let waitAttempts = 0;
+    
     // Find the button by text (robust search)
     const buttons = Array.from(document.querySelectorAll('button, tp-yt-paper-button, yt-button-shape, a, span, div'));
-    // Find the deepest element that contains "view email" but doesn't have too much text
     const emailBtn = buttons.find(b => {
         const text = b.textContent ? b.textContent.toLowerCase().trim() : '';
         return text.includes('view email') && text.length < 30;
@@ -491,63 +514,39 @@ async function executeWaterfall(id, channelFallbackName) {
         usedCaptcha = true;
         console.log('[LeadTube Bot] Clicking View Email button...');
         emailBtn.click();
-
-        await sleep(2000);
-
-        // Check if a CAPTCHA iframe appeared
+        
+        await sleep(1000);
         const captchaIframe = document.querySelector('iframe[src*="recaptcha"], iframe[title*="recaptcha" i]');
         if (captchaIframe) {
-            console.log('[LeadTube Bot] CAPTCHA detected! Pausing and alerting user...');
             chrome.runtime.sendMessage({ type: 'REQUIRE_MANUAL_CAPTCHA' });
-            
-            // Inject a floating fallback UI so user can paste the email directly from EasyKOL
-            const fallbackDiv = document.createElement('div');
-            fallbackDiv.innerHTML = \`
-                <div style="position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #1e1e2e; color: white; padding: 15px 25px; border-radius: 8px; z-index: 999999; box-shadow: 0 10px 25px rgba(0,0,0,0.5); border: 2px solid #8b5cf6; display: flex; align-items: center; gap: 15px; font-family: sans-serif;">
-                    <div>
-                        <strong style="color: #10b981;">LeadTube Paused on CAPTCHA</strong><br/>
-                        <span style="font-size: 12px; color: #a1a1aa;">If EasyKOL found the email, paste it here to skip CAPTCHA!</span>
-                    </div>
-                    <input type="text" id="leadtube-quick-email" placeholder="Paste email here..." style="padding: 8px 12px; border-radius: 4px; border: 1px solid #4b5563; background: #374151; color: white; outline: none; min-width: 200px;" />
-                    <button id="leadtube-quick-submit" style="background: #8b5cf6; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">Skip CAPTCHA</button>
-                </div>
-            \`;
-            document.body.appendChild(fallbackDiv);
-            
-            document.getElementById('leadtube-quick-submit').addEventListener('click', () => {
-                const val = document.getElementById('leadtube-quick-email').value.trim();
-                if (val && val.includes('@')) {
-                    emails = [val];
-                    fallbackDiv.remove();
-                }
-            });
-
-            // Poll every 200ms until the email appears (user solved captcha OR pasted into fallback)
-            let waitAttempts = 0;
-            while (waitAttempts < 1500 && emails.length === 0) { // wait up to 5 minutes
-                await sleep(200);
-                
-                // Check if email link appeared (usually a mailto: link from CAPTCHA solve)
-                const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));
-                if (mailtoLinks.length > 0) {
-                    emails = [mailtoLinks[0].href.replace('mailto:', '').trim()];
-                    console.log('[LeadTube Bot] CAPTCHA Solved! Extracted email:', emails);
-                    if (fallbackDiv) fallbackDiv.remove();
-                    break;
-                }
-                waitAttempts++;
-            }
-        } else {
-            // Sometimes it doesn't require a captcha!
-            await sleep(2000);
-            const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));
-            if (mailtoLinks.length > 0) {
-                emails = [mailtoLinks[0].href.replace('mailto:', '').trim()];
-            }
         }
     } else {
-        console.log('[LeadTube Bot] No email button found on this channel.');
+        console.log('[LeadTube Bot] No "View Email" button found! Waiting to see if user pastes it...');
     }
+
+    // Poll for user input OR captcha solve
+    while (waitAttempts < 1500 && emails.length === 0) { // wait up to 5 minutes
+        await sleep(200);
+        
+        // Check if email link appeared (usually a mailto: link from CAPTCHA solve or non-captcha channel)
+        const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));
+        if (mailtoLinks.length > 0) {
+            emails = [mailtoLinks[0].href.replace('mailto:', '').trim()];
+            console.log('[LeadTube Bot] Extracted email from mailto:', emails);
+            break;
+        }
+        
+        // If the button wasn't found, and there's no CAPTCHA, and 15 seconds have passed... timeout unless they paste.
+        if (!emailBtn && waitAttempts > 75) { // 75 * 200ms = 15s
+            console.log('[LeadTube Bot] Timeout waiting for manual fallback.');
+            break;
+        }
+        
+        waitAttempts++;
+    }
+
+    // Cleanup
+    if (fallbackDiv) fallbackDiv.remove();
 
     // Finish
     await sendScrapeDone();
